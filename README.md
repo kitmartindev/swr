@@ -7,6 +7,7 @@
   <a aria-label="NPM version" href="https://www.npmjs.com/package/swr">
     <img alt="" src="https://img.shields.io/npm/v/swr">
   </a>
+<a href="https://app.fossa.io/projects/git%2Bgithub.com%2Fkitmartindev%2Fswr?ref=badge_shield" alt="FOSSA Status"><img src="https://app.fossa.io/api/projects/git%2Bgithub.com%2Fkitmartindev%2Fswr.svg?type=shield"/></a>
   <a aria-label="Package size" href="https://bundlephobia.com/result?p=swr">
     <img alt="" src="https://img.shields.io/bundlephobia/minzip/swr">
   </a>
@@ -14,6 +15,9 @@
     <img alt="" src="https://img.shields.io/npm/l/swr">
   </a>
 </p>
+
+
+[![FOSSA Status](https://app.fossa.io/api/projects/git%2Bgithub.com%2Fkitmartindev%2Fswr.svg?type=large)](https://app.fossa.io/projects/git%2Bgithub.com%2Fkitmartindev%2Fswr?ref=badge_large)
 
 ## Introduction
 
