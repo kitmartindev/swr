@@ -1,63 +1,70 @@
+import deepEqual from 'fast-deep-equal'
 import {
-  useState,
+  useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
+  useState,
   useRef,
-  useContext,
-  useCallback
+  useMemo
 } from 'react'
-import { unstable_batchedUpdates } from './libs/reactBatchedUpdates'
-import throttle from './libs/throttle'
-import deepEqual from 'fast-deep-equal'
-
-import {
-  keyInterface,
-  ConfigInterface,
-  RevalidateOptionInterface,
-  updaterInterface,
-  triggerInterface,
-  mutateInterface,
-  broadcastStateInterface,
-  responseInterface,
-  fetcherFn
-} from './types'
 
 import defaultConfig, {
+  cacheGet,
+  cacheSet,
+  CACHE_REVALIDATORS,
   CONCURRENT_PROMISES,
   CONCURRENT_PROMISES_TS,
   FOCUS_REVALIDATORS,
-  CACHE_REVALIDATORS,
-  MUTATION_TS,
-  cacheGet,
-  cacheSet
+  MUTATION_TS
 } from './config'
-import SWRConfigContext from './swr-config-context'
-import isDocumentVisible from './libs/is-document-visible'
-import useHydration from './libs/use-hydration'
 import hash from './libs/hash'
+import isDocumentVisible from './libs/is-document-visible'
+import isOnline from './libs/is-online'
+import throttle from './libs/throttle'
+import SWRConfigContext from './swr-config-context'
+import {
+  actionType,
+  broadcastStateInterface,
+  ConfigInterface,
+  fetcherFn,
+  keyInterface,
+  mutateInterface,
+  responseInterface,
+  RevalidateOptionInterface,
+  triggerInterface,
+  updaterInterface
+} from './types'
 
 const IS_SERVER = typeof window === 'undefined'
 
+// React currently throws a warning when using useLayoutEffect on the server.
+// To get around it, we can conditionally useEffect on the server (no-op) and
+// useLayoutEffect in the browser.
+const useIsomorphicLayoutEffect = IS_SERVER ? useEffect : useLayoutEffect
+
 // TODO: introduce namepsace for the cache
 const getErrorKey = key => (key ? 'err@' + key : '')
-const getKeyArgs = _key => {
-  let key: string
+const getKeyArgs = key => {
   let args = null
-  if (typeof _key === 'function') {
+  if (typeof key === 'function') {
     try {
-      key = _key()
+      key = key()
     } catch (err) {
       // dependencies not ready
       key = ''
     }
-  } else if (Array.isArray(_key)) {
+  }
+
+  if (Array.isArray(key)) {
     // args array
-    key = hash(_key)
-    args = _key
+    args = key
+    key = hash(key)
   } else {
     // convert null to ''
-    key = String(_key || '')
+    key = String(key || '')
   }
+
   return [key, args]
 }
 
@@ -70,7 +77,7 @@ const trigger: triggerInterface = (_key, shouldRevalidate = true) => {
     const currentData = cacheGet(key)
     const currentError = cacheGet(getErrorKey(key))
     for (let i = 0; i < updaters.length; ++i) {
-      updaters[i](shouldRevalidate, currentData, currentError)
+      updaters[i](shouldRevalidate, currentData, currentError, true)
     }
   }
 }
@@ -84,21 +91,42 @@ const broadcastState: broadcastStateInterface = (key, data, error) => {
   }
 }
 
-const mutate: mutateInterface = (_key, data, shouldRevalidate = true) => {
+const mutate: mutateInterface = async (_key, _data, shouldRevalidate) => {
   const [key] = getKeyArgs(_key)
   if (!key) return
 
   // update timestamp
   MUTATION_TS[key] = Date.now() - 1
 
-  // update cached data
-  cacheSet(key, data)
+  let data, error
+
+  if (_data && typeof _data.then === 'function') {
+    // `_data` is a promise
+    try {
+      data = await _data
+    } catch (err) {
+      error = err
+    }
+  } else {
+    data = _data
+
+    if (typeof shouldRevalidate === 'undefined') {
+      // if it's a sync mutation, we trigger the revalidation by default
+      // because in most cases it's a local mutation
+      shouldRevalidate = true
+    }
+  }
+
+  if (typeof data !== 'undefined') {
+    // update cached data
+    cacheSet(key, data)
+  }
 
   // update existing SWR Hooks' state
   const updaters = CACHE_REVALIDATORS[key]
   if (updaters) {
     for (let i = 0; i < updaters.length; ++i) {
-      updaters[i](shouldRevalidate, data)
+      updaters[i](!!shouldRevalidate, data, error, true)
     }
   }
 }
@@ -124,13 +152,15 @@ function useSWR<Data = any, Error = any>(
   if (args.length >= 1) {
     _key = args[0]
   }
-  if (typeof args[1] === 'function') {
+  if (args.length > 2) {
     fn = args[1]
-  } else if (typeof args[1] === 'object') {
-    config = args[1]
-  }
-  if (typeof args[2] === 'object') {
     config = args[2]
+  } else {
+    if (typeof args[1] === 'function') {
+      fn = args[1]
+    } else if (typeof args[1] === 'object') {
+      config = args[1]
+    }
   }
 
   // we assume `key` as the identifier of the request
@@ -153,33 +183,47 @@ function useSWR<Data = any, Error = any>(
     fn = config.fetcher
   }
 
-  // it is fine to call `useHydration` conditionally here
-  // because `config.suspense` should never change
-  const shouldReadCache = config.suspense || !useHydration()
+  const initialData = cacheGet(key) || config.initialData
+  const initialError = cacheGet(keyErr)
 
-  // stale: get from cache
-  let [data, setData] = useState(
-    (shouldReadCache ? cacheGet(key) : undefined) || config.initialData
-  )
-  let [error, setError] = useState(
-    shouldReadCache ? cacheGet(keyErr) : undefined
-  )
+  // if a state is accessed (data, error or isValidating),
+  // we add the state to dependencies so if the state is
+  // updated in the future, we can trigger a rerender
+  const stateDependencies = useRef({
+    data: false,
+    error: false,
+    isValidating: false
+  })
+  const stateRef = useRef({
+    data: initialData,
+    error: initialError,
+    isValidating: false
+  })
 
-  // if there's any ongoing request
-  let [isValidating, setIsValidating] = useState(false)
+  const rerender = useState(null)[1]
+  let dispatch = useCallback(payload => {
+    let shouldUpdateState = false
+    for (let k in payload) {
+      stateRef.current[k] = payload[k]
+      if (stateDependencies.current[k]) {
+        shouldUpdateState = true
+      }
+    }
+    if (shouldUpdateState || config.suspense) {
+      rerender({})
+    }
+  }, [])
 
   // error ref inside revalidate (is last request errored?)
   const unmountedRef = useRef(false)
   const keyRef = useRef(key)
-  const errorRef = useRef(error)
-  const dataRef = useRef(data)
 
   // start a revalidation
   const revalidate = useCallback(
     async (
       revalidateOpts: RevalidateOptionInterface = {}
     ): Promise<boolean> => {
-      if (!key) return false
+      if (!key || !fn) return false
       if (unmountedRef.current) return false
       revalidateOpts = Object.assign({ dedupe: false }, revalidateOpts)
 
@@ -189,7 +233,9 @@ function useSWR<Data = any, Error = any>(
 
       // start fetching
       try {
-        setIsValidating(true)
+        dispatch({
+          isValidating: true
+        })
 
         let newData
         let startAt
@@ -200,6 +246,20 @@ function useSWR<Data = any, Error = any>(
           startAt = CONCURRENT_PROMISES_TS[key]
           newData = await CONCURRENT_PROMISES[key]
         } else {
+          // if not deduping the request (hard revalidate) but
+          // there're other ongoing request(s) at the same time,
+          // we need to ignore the other result(s) to avoid
+          // possible race conditions:
+          // req1------------------>res1
+          //      req2-------->res2
+          // in that case, the second response should not be overridden
+          // by the first one.
+          if (CONCURRENT_PROMISES[key]) {
+            // we can mark it as a mutation to ignore
+            // all requests which are fired before this one
+            MUTATION_TS[key] = Date.now() - 1
+          }
+
           // if no cache being rendered currently (it shows a blank page),
           // we trigger the loading slow event.
           if (config.loadingTimeout && !cacheGet(key)) {
@@ -232,7 +292,7 @@ function useSWR<Data = any, Error = any>(
         // we have to ignore the result because it could override.
         // meanwhile, a new revalidation should be triggered by the mutation.
         if (MUTATION_TS[key] && startAt <= MUTATION_TS[key]) {
-          setIsValidating(false)
+          dispatch({ isValidating: false })
           return false
         }
 
@@ -240,29 +300,30 @@ function useSWR<Data = any, Error = any>(
         cacheSet(keyErr, undefined)
         keyRef.current = key
 
-        // batch state updates
-        unstable_batchedUpdates(() => {
-          setIsValidating(false)
+        // new state for the reducer
+        const newState: actionType<Data, Error> = {
+          isValidating: false
+        }
 
-          if (typeof errorRef.current !== 'undefined') {
-            // we don't have an error
-            setError(undefined)
-            errorRef.current = undefined
-          }
-          if (deepEqual(dataRef.current, newData)) {
-            // deep compare to avoid extra re-render
-            // do nothing
-          } else {
-            // data changed
-            setData(newData)
-            dataRef.current = newData
-          }
+        if (typeof stateRef.current.error !== 'undefined') {
+          // we don't have an error
+          newState.error = undefined
+        }
+        if (deepEqual(stateRef.current.data, newData)) {
+          // deep compare to avoid extra re-render
+          // do nothing
+        } else {
+          // data changed
+          newState.data = newData
+        }
 
-          if (!shouldDeduping) {
-            // also update other hooks
-            broadcastState(key, newData, undefined)
-          }
-        })
+        // merge the new state
+        dispatch(newState)
+
+        if (!shouldDeduping) {
+          // also update other hooks
+          broadcastState(key, newData, undefined)
+        }
       } catch (err) {
         delete CONCURRENT_PROMISES[key]
         delete CONCURRENT_PROMISES_TS[key]
@@ -272,13 +333,11 @@ function useSWR<Data = any, Error = any>(
 
         // get a new error
         // don't use deep equal for errors
-        if (errorRef.current !== err) {
-          errorRef.current = err
-
-          unstable_batchedUpdates(() => {
-            // we keep the stale data
-            setIsValidating(false)
-            setError(err)
+        if (stateRef.current.error !== err) {
+          // we keep the stale data
+          dispatch({
+            isValidating: false,
+            error: err
           })
 
           if (!shouldDeduping) {
@@ -308,11 +367,6 @@ function useSWR<Data = any, Error = any>(
     [key]
   )
 
-  // React currently throws a warning when using useLayoutEffect on the server.
-  // To get around it, we can conditionally useEffect on the server (no-op) and
-  // useLayoutEffect in the browser.
-  const useIsomorphicLayoutEffect = IS_SERVER ? useEffect : useLayoutEffect
-
   // mounted (client side rendering)
   useIsomorphicLayoutEffect(() => {
     if (!key) return undefined
@@ -324,7 +378,7 @@ function useSWR<Data = any, Error = any>(
     // we need to update the data from the cache
     // and trigger a revalidation
 
-    const currentHookData = dataRef.current
+    const currentHookData = stateRef.current.data
     const latestKeyedData = cacheGet(key) || config.initialData
 
     // update the state if the key changed or cache updated
@@ -332,8 +386,7 @@ function useSWR<Data = any, Error = any>(
       keyRef.current !== key ||
       !deepEqual(currentHookData, latestKeyedData)
     ) {
-      setData(latestKeyedData)
-      dataRef.current = latestKeyedData
+      dispatch({ data: latestKeyedData })
       keyRef.current = key
     }
 
@@ -341,15 +394,18 @@ function useSWR<Data = any, Error = any>(
     const softRevalidate = () => revalidate({ dedupe: true })
 
     // trigger a revalidation
-    if (
-      typeof latestKeyedData !== 'undefined' &&
-      window['requestIdleCallback']
-    ) {
-      // delay revalidate if there's cache
-      // to not block the rendering
-      window['requestIdleCallback'](softRevalidate)
-    } else {
-      softRevalidate()
+    if (!config.initialData) {
+      if (
+        typeof latestKeyedData !== 'undefined' &&
+        !IS_SERVER &&
+        window['requestIdleCallback']
+      ) {
+        // delay revalidate if there's cache
+        // to not block the rendering
+        window['requestIdleCallback'](softRevalidate)
+      } else {
+        softRevalidate()
+      }
     }
 
     // whenever the window gets focused, revalidate
@@ -369,28 +425,39 @@ function useSWR<Data = any, Error = any>(
     const onUpdate: updaterInterface<Data, Error> = (
       shouldRevalidate = true,
       updatedData,
-      updatedError
+      updatedError,
+      dedupe = true
     ) => {
       // update hook state
-      unstable_batchedUpdates(() => {
-        if (
-          typeof updatedData !== 'undefined' &&
-          !deepEqual(dataRef.current, updatedData)
-        ) {
-          setData(updatedData)
-          dataRef.current = updatedData
-        }
-        // always update error
-        // because it can be `undefined`
-        if (errorRef.current !== updatedError) {
-          setError(updatedError)
-          errorRef.current = updatedError
-        }
-        keyRef.current = key
-      })
+      const newState: actionType<Data, Error> = {}
+      let needUpdate = false
 
+      if (
+        typeof updatedData !== 'undefined' &&
+        !deepEqual(stateRef.current.data, updatedData)
+      ) {
+        newState.data = updatedData
+        needUpdate = true
+      }
+
+      // always update error
+      // because it can be `undefined`
+      if (stateRef.current.error !== updatedError) {
+        newState.error = updatedError
+        needUpdate = true
+      }
+
+      if (needUpdate) {
+        dispatch(newState)
+      }
+
+      keyRef.current = key
       if (shouldRevalidate) {
-        return softRevalidate()
+        if (dedupe) {
+          return softRevalidate()
+        } else {
+          return revalidate()
+        }
       }
       return false
     }
@@ -402,49 +469,74 @@ function useSWR<Data = any, Error = any>(
       CACHE_REVALIDATORS[key].push(onUpdate)
     }
 
-    // set up polling
-    let timeout = null
-    if (config.refreshInterval) {
-      const tick = async () => {
-        if (
-          !errorRef.current &&
-          (config.refreshWhenHidden || isDocumentVisible())
-        ) {
-          // only revalidate when the page is visible
-          // if API request errored, we stop polling in this round
-          // and let the error retry function handle it
-          await softRevalidate()
-        }
-
-        const interval = config.refreshInterval
-        timeout = setTimeout(tick, interval)
-      }
-      timeout = setTimeout(tick, config.refreshInterval)
+    // set up reconnecting when the browser regains network connection
+    let reconnect = null
+    if (config.revalidateOnReconnect) {
+      reconnect = addEventListener('online', softRevalidate)
     }
 
     return () => {
       // cleanup
-      setData = () => null
-      setError = () => null
-      setIsValidating = () => null
+      dispatch = () => null
 
       // mark it as unmounted
       unmountedRef.current = true
 
       if (onFocus && FOCUS_REVALIDATORS[key]) {
-        const index = FOCUS_REVALIDATORS[key].indexOf(onFocus)
-        if (index >= 0) FOCUS_REVALIDATORS[key].splice(index, 1)
+        const revalidators = FOCUS_REVALIDATORS[key]
+        const index = revalidators.indexOf(onFocus)
+        if (index >= 0) {
+          // 10x faster than splice
+          // https://jsperf.com/array-remove-by-index
+          revalidators[index] = revalidators[revalidators.length - 1]
+          revalidators.pop()
+        }
       }
       if (CACHE_REVALIDATORS[key]) {
-        const index = CACHE_REVALIDATORS[key].indexOf(onUpdate)
-        if (index >= 0) CACHE_REVALIDATORS[key].splice(index, 1)
+        const revalidators = CACHE_REVALIDATORS[key]
+        const index = revalidators.indexOf(onUpdate)
+        if (index >= 0) {
+          revalidators[index] = revalidators[revalidators.length - 1]
+          revalidators.pop()
+        }
       }
 
-      if (timeout !== null) {
-        clearTimeout(timeout)
+      if (reconnect !== null) {
+        removeEventListener('online', reconnect)
       }
     }
-  }, [key, config.refreshInterval, revalidate])
+  }, [key, revalidate])
+
+  // set up polling
+  useIsomorphicLayoutEffect(() => {
+    let timer = null
+    const tick = async () => {
+      if (
+        !stateRef.current.error &&
+        (config.refreshWhenHidden || isDocumentVisible()) &&
+        (!config.refreshWhenOffline && isOnline())
+      ) {
+        // only revalidate when the page is visible
+        // if API request errored, we stop polling in this round
+        // and let the error retry function handle it
+        await revalidate({ dedupe: true })
+      }
+      if (config.refreshInterval) {
+        timer = setTimeout(tick, config.refreshInterval)
+      }
+    }
+    if (config.refreshInterval) {
+      timer = setTimeout(tick, config.refreshInterval)
+    }
+    return () => {
+      if (timer) clearTimeout(timer)
+    }
+  }, [
+    config.refreshInterval,
+    config.refreshWhenHidden,
+    config.refreshWhenOffline,
+    revalidate
+  ])
 
   // suspense
   if (config.suspense) {
@@ -492,19 +584,40 @@ function useSWR<Data = any, Error = any>(
       error: latestError,
       data: latestData,
       revalidate,
-      isValidating
+      isValidating: stateRef.current.isValidating
     }
   }
 
-  return {
-    error,
-    // `key` might be changed in the upcoming hook re-render,
-    // but the previous state will stay
-    // so we need to match the latest key and data
-    data: keyRef.current === key ? data : undefined,
-    revalidate, // handler
-    isValidating
-  }
+  // define returned state
+  // can be memorized since the state is a ref
+  return useMemo(() => {
+    const state = { revalidate } as responseInterface<Data, Error>
+    Object.defineProperties(state, {
+      error: {
+        // `key` might be changed in the upcoming hook re-render,
+        // but the previous state will stay
+        // so we need to match the latest key and data (fallback to `initialData`)
+        get: function() {
+          stateDependencies.current.error = true
+          return keyRef.current === key ? stateRef.current.error : initialError
+        }
+      },
+      data: {
+        get: function() {
+          stateDependencies.current.data = true
+          return keyRef.current === key ? stateRef.current.data : initialData
+        }
+      },
+      isValidating: {
+        get: function() {
+          stateDependencies.current.isValidating = true
+          return stateRef.current.isValidating
+        }
+      }
+    })
+
+    return state
+  }, [revalidate])
 }
 
 const SWRConfig = SWRConfigContext.Provider

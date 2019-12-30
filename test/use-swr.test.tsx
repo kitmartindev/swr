@@ -223,9 +223,30 @@ describe('useSWR', () => {
     )
   })
 
-  it('should accept initial data', async () => {
+  it('should accept function returning args', async () => {
+    const obj = { v: 'hello' }
+    const arr = ['world']
+
     function Page() {
-      const { data } = useSWR('initial-data-1', () => 'SWR', {
+      const { data } = useSWR(
+        () => ['args-3', obj, arr],
+        (a, b, c) => a + b.v + c[0]
+      )
+
+      return <div>{data}</div>
+    }
+
+    const { container } = render(<Page />)
+
+    await waitForDomChange({ container })
+    expect(container.textContent).toMatchInlineSnapshot(`"args-3helloworld"`)
+  })
+
+  it('should accept initial data', async () => {
+    const fetcher = jest.fn(() => 'SWR')
+
+    function Page() {
+      const { data } = useSWR('initial-data-1', fetcher, {
         initialData: 'Initial'
       })
       return <div>hello, {data}</div>
@@ -233,13 +254,107 @@ describe('useSWR', () => {
 
     const { container } = render(<Page />)
 
+    expect(fetcher).not.toBeCalled()
     expect(container.firstChild.textContent).toMatchInlineSnapshot(
       `"hello, Initial"`
     )
+  })
+
+  it('should set config as second parameter', async () => {
+    const fetcher = jest.fn(() => 'SWR')
+
+    function Page() {
+      const { data } = useSWR('config-as-second-param', {
+        fetcher
+      })
+
+      return <div>hello, {data}</div>
+    }
+
+    const { container } = render(<Page />)
+
+    expect(container.firstChild.textContent).toMatchInlineSnapshot(`"hello, "`)
+    expect(fetcher).toBeCalled()
     await waitForDomChange({ container }) // mount
     expect(container.firstChild.textContent).toMatchInlineSnapshot(
       `"hello, SWR"`
     )
+  })
+})
+
+describe('useSWR - loading', () => {
+  afterEach(cleanup)
+
+  const loadData = () => new Promise(res => setTimeout(() => res('data'), 100))
+
+  it('should return loading state', async () => {
+    let renderCount = 0
+    function Page() {
+      const { data, isValidating } = useSWR('is-validating-1', loadData)
+      renderCount++
+      return (
+        <div>
+          hello, {data}, {isValidating ? 'loading' : 'ready'}
+        </div>
+      )
+    }
+
+    const { container } = render(<Page />)
+    expect(container.textContent).toMatchInlineSnapshot(`"hello, , loading"`)
+    await waitForDomChange({ container })
+    expect(container.textContent).toMatchInlineSnapshot(`"hello, data, ready"`)
+
+    //    data       isValidating
+    // -> undefined, false
+    // -> undefined, true
+    // -> data,      false
+    expect(renderCount).toEqual(3)
+  })
+
+  it('should avoid extra rerenders', async () => {
+    let renderCount = 0
+    function Page() {
+      // we never access `isValidating`, so it will not trigger rerendering
+      const { data } = useSWR('is-validating-2', loadData)
+      renderCount++
+      return <div>hello, {data}</div>
+    }
+
+    const { container } = render(<Page />)
+    await waitForDomChange({ container })
+    expect(container.textContent).toMatchInlineSnapshot(`"hello, data"`)
+
+    //    data
+    // -> undefined
+    // -> data
+    expect(renderCount).toEqual(2)
+  })
+
+  it('should avoid extra rerenders while fetching', async () => {
+    let renderCount = 0,
+      dataLoaded = false
+    const loadDataWithLog = () =>
+      new Promise(res =>
+        setTimeout(() => {
+          dataLoaded = true
+          res('data')
+        }, 100)
+      )
+
+    function Page() {
+      // we never access anything
+      useSWR('is-validating-3', loadDataWithLog)
+      renderCount++
+      return <div>hello</div>
+    }
+
+    const { container } = render(<Page />)
+    expect(container.textContent).toMatchInlineSnapshot(`"hello"`)
+
+    await act(() => new Promise(res => setTimeout(res, 110))) // wait
+    // it doesn't re-render, but fetch was triggered
+    expect(renderCount).toEqual(1)
+    expect(dataLoaded).toEqual(true)
   })
 })
 
@@ -295,6 +410,60 @@ describe('useSWR - refresh', () => {
     await act(() => new Promise(res => setTimeout(res, 200))) // update
     expect(container.firstChild.textContent).toMatchInlineSnapshot(`"count: 2"`)
   })
+
+  it('should update data upon interval changes', async () => {
+    let count = 0
+    function Page() {
+      const [int, setInt] = React.useState(200)
+      const { data } = useSWR('/api', () => count++, {
+        refreshInterval: int,
+        dedupingInterval: 100
+      })
+      return <div onClick={() => setInt(int + 100)}>count: {data}</div>
+    }
+    const { container } = render(<Page />)
+    expect(container.firstChild.textContent).toMatchInlineSnapshot(`"count: "`)
+
+    await waitForDomChange({ container }) // mount
+    expect(container.firstChild.textContent).toMatchInlineSnapshot(`"count: 0"`)
+    await act(() => {
+      return new Promise(res => setTimeout(res, 210))
+    })
+    expect(container.firstChild.textContent).toMatchInlineSnapshot(`"count: 1"`)
+    await act(() => {
+      return new Promise(res => setTimeout(res, 50))
+    })
+    expect(container.firstChild.textContent).toMatchInlineSnapshot(`"count: 1"`)
+    await act(() => {
+      return new Promise(res => setTimeout(res, 150))
+    })
+    expect(container.firstChild.textContent).toMatchInlineSnapshot(`"count: 2"`)
+    await act(() => {
+      fireEvent.click(container.firstElementChild)
+      // it will clear 200ms timer and setup a new 300ms timer
+      return new Promise(res => setTimeout(res, 200))
+    })
+    expect(container.firstChild.textContent).toMatchInlineSnapshot(`"count: 2"`)
+    await act(() => {
+      return new Promise(res => setTimeout(res, 110))
+    })
+    expect(container.firstChild.textContent).toMatchInlineSnapshot(`"count: 3"`)
+    await act(() => {
+      // wait for new 300ms timer
+      return new Promise(res => setTimeout(res, 310))
+    })
+    expect(container.firstChild.textContent).toMatchInlineSnapshot(`"count: 4"`)
+    await act(() => {
+      fireEvent.click(container.firstElementChild)
+      // it will clear 300ms timer and setup a new 400ms timer
+      return new Promise(res => setTimeout(res, 300))
+    })
+    expect(container.firstChild.textContent).toMatchInlineSnapshot(`"count: 4"`)
+    await act(() => {
+      return new Promise(res => setTimeout(res, 110))
+    })
+    expect(container.firstChild.textContent).toMatchInlineSnapshot(`"count: 5"`)
+  })
 })
 
 describe('useSWR - revalidate', () => {
@@ -345,6 +514,41 @@ describe('useSWR - revalidate', () => {
       return new Promise(res => setTimeout(res, 1))
     })
     expect(container.firstChild.textContent).toMatchInlineSnapshot(`"1, 1"`)
+  })
+
+  it('should respect sequences of revalidation calls (cope with race condition)', async () => {
+    let faster = false
+
+    function Page() {
+      const { data, revalidate } = useSWR(
+        'race',
+        () =>
+          new Promise(res => {
+            const value = faster ? 1 : 0
+            setTimeout(() => res(value), faster ? 100 : 200)
+          })
+      )
+
+      return <button onClick={revalidate}>{data}</button>
+    }
+
+    const { container } = render(<Page />)
+
+    expect(container.firstChild.textContent).toMatchInlineSnapshot(`""`)
+    await waitForDomChange({ container })
+    expect(container.firstChild.textContent).toMatchInlineSnapshot(`"0"`)
+
+    await act(async () => {
+      // trigger the slower revalidation
+      faster = false
+      fireEvent.click(container.firstElementChild)
+      await new Promise(res => setTimeout(res, 10))
+      // trigger the faster revalidation
+      faster = true
+      fireEvent.click(container.firstElementChild)
+      return new Promise(res => setTimeout(res, 210))
+    })
+    expect(container.firstChild.textContent).toMatchInlineSnapshot(`"1"`)
   })
 })
 
@@ -582,6 +786,30 @@ describe('useSWR - local mutation', () => {
     expect(container.firstChild.textContent).toMatchInlineSnapshot(
       `"data: truth"`
     )
+  })
+
+  it('should support async mutation', async () => {
+    function Page() {
+      const { data } = useSWR('mutate-1', () => 0, {
+        dedupingInterval: 0
+      })
+      return <div>data: {data}</div>
+    }
+    const { container } = render(<Page />)
+
+    // hydration
+    expect(container.textContent).toMatchInlineSnapshot(`"data: "`)
+    await waitForDomChange({ container }) // mount
+    expect(container.textContent).toMatchInlineSnapshot(`"data: 0"`)
+    await act(() => {
+      // mutate and revalidate
+      return mutate(
+        'mutate-1',
+        new Promise(res => setTimeout(() => res(999), 100))
+      )
+    })
+    await act(() => new Promise(res => setTimeout(res, 110)))
+    expect(container.textContent).toMatchInlineSnapshot(`"data: 999"`)
   })
 })
 

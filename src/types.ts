@@ -11,7 +11,9 @@ export interface ConfigInterface<
 
   refreshInterval?: number
   refreshWhenHidden?: boolean
+  refreshWhenOffline?: boolean
   revalidateOnFocus?: boolean
+  revalidateOnReconnect?: boolean
   shouldRetryOnError?: boolean
   fetcher?: Fn
   suspense?: boolean
@@ -42,12 +44,13 @@ export interface RevalidateOptionInterface {
   dedupe?: boolean
 }
 
-type keyFunction = () => string
-export type keyInterface = string | keyFunction | any[] | null
+type keyFunction = () => string | any[] | null
+export type keyInterface = keyFunction | string | any[] | null
 export type updaterInterface<Data = any, Error = any> = (
   shouldRevalidate?: boolean,
   data?: Data,
-  error?: Error
+  error?: Error,
+  shouldDedupe?: boolean
 ) => boolean | Promise<boolean>
 export type triggerInterface = (
   key: keyInterface,
@@ -55,7 +58,7 @@ export type triggerInterface = (
 ) => void
 export type mutateInterface<Data = any> = (
   key: keyInterface,
-  data: Data,
+  data: Data | Promise<Data>,
   shouldRevalidate?: boolean
 ) => void
 export type broadcastStateInterface<Data = any, Error = any> = (
@@ -98,4 +101,10 @@ export type pagesResponseInterface = {
   isReachingEnd: boolean
   isEmpty: boolean
   loadMore: () => void
+}
+
+export type actionType<Data, Error> = {
+  data?: Data
+  error?: Error
+  isValidating?: boolean
 }

@@ -1,17 +1,16 @@
 import isDocumentVisible from './libs/is-document-visible'
 import isOnline from './libs/is-online'
-
 import {
   ConfigInterface,
-  revalidateType,
-  RevalidateOptionInterface
+  RevalidateOptionInterface,
+  revalidateType
 } from './types'
 
 // Cache
 const __cache = new Map()
 
 function cacheGet(key: string): any {
-  return __cache.get(key) || undefined
+  return __cache.get(key)
 }
 
 function cacheSet(key: string, value: any) {
@@ -65,7 +64,9 @@ const defaultConfig: ConfigInterface = {
 
   refreshInterval: 0,
   revalidateOnFocus: true,
+  revalidateOnReconnect: true,
   refreshWhenHidden: false,
+  refreshWhenOffline: false,
   shouldRetryOnError: true,
   suspense: false
 }
